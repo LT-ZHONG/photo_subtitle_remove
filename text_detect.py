@@ -1,7 +1,9 @@
-import numpy as np
-import cv2 as cv
 import math
 import argparse
+import cv2 as cv
+import numpy as np
+
+from lama_inpaint import LamaInpaint
 
 parser = argparse.ArgumentParser(
     description="Use this script to run TensorFlow implementation (https://github.com/argman/EAST) of "
@@ -9,14 +11,10 @@ parser = argparse.ArgumentParser(
                 "The OCR model can be obtained from converting the pretrained CRNN model to .onnx format from the github repository https://github.com/meijieru/crnn.pytorch"
                 "Or you can download trained OCR model directly from https://drive.google.com/drive/folders/1cTbQ3nuZG-EKWak6emD_s8_hHXWz7lAr?usp=sharing")
 parser.add_argument('--input', default='sign.jpg', help='Path to input image')
-parser.add_argument('--model', default='frozen_east_text_detection.pb',
-                    help='Path to a binary .pb file contains trained detector network.')
-parser.add_argument('--ocr', default="CRNN_VGG_BiLSTM_CTC.onnx",
-                    help="Path to a binary .pb or .onnx file contains trained recognition network", )
-parser.add_argument('--width', type=int, default=320,
-                    help='Preprocess input image by resizing to a specific width. It should be multiple by 32.')
-parser.add_argument('--height', type=int, default=320,
-                    help='Preprocess input image by resizing to a specific height. It should be multiple by 32.')
+parser.add_argument('--model', default='frozen_east_text_detection.pb', help='Path to a binary .pb file contains trained detector network.')
+parser.add_argument('--ocr', default="CRNN_VGG_BiLSTM_CTC.onnx", help="Path to a binary .pb or .onnx file contains trained recognition network", )
+parser.add_argument('--width', type=int, default=320, help='Preprocess input image by resizing to a specific width. It should be multiple by 32.')
+parser.add_argument('--height', type=int, default=320, help='Preprocess input image by resizing to a specific height. It should be multiple by 32.')
 parser.add_argument('--thr', type=float, default=0.5, help='Confidence threshold.')
 parser.add_argument('--nms', type=float, default=0.4, help='Non-maximum suppression threshold.')
 args = parser.parse_args()
@@ -65,8 +63,7 @@ def decodeBoundingBoxes(scores, geometry, scoreThresh):
             w = x1_data[x] + x3_data[x]
 
             # Calculate offset
-            offset = (
-            [offsetX + cosA * x1_data[x] + sinA * x2_data[x], offsetY - sinA * x1_data[x] + cosA * x2_data[x]])
+            offset = ([offsetX + cosA * x1_data[x] + sinA * x2_data[x], offsetY - sinA * x1_data[x] + cosA * x2_data[x]])
 
             # Find points for rectangle
             p1 = (-sinA * h + offset[0], -cosA * h + offset[1])
@@ -77,6 +74,20 @@ def decodeBoundingBoxes(scores, geometry, scoreThresh):
 
     # Return detections and confidences
     return [detections, confidences]
+
+
+def create_mask(size, coords_list):
+    mask = np.zeros(size, dtype="uint8")
+    if coords_list:
+        for coords in coords_list:
+            xmin, xmax, ymin, ymax = coords
+            # 为了避免框过小，放大10个像素
+            x1 = max(xmin - 10, 0)
+            y1 = max(ymin - 10, 0)
+            x2 = xmax + 10
+            y2 = ymax + 10
+            cv.rectangle(mask, (x1, y1), (x2, y2), (255, 255, 255), thickness=-1)
+    return mask
 
 
 if __name__ == "__main__":
@@ -90,11 +101,10 @@ if __name__ == "__main__":
     # Load network
     detector = cv.dnn.readNet(modelDetector)
 
-    outNames = ["feature_fusion/Conv_7/Sigmoid",
-                "feature_fusion/concat_3"]
+    outNames = ["feature_fusion/Conv_7/Sigmoid", "feature_fusion/concat_3"]
 
     frame = cv.imread(args.input)
-    tickmeter = cv.TickMeter()
+    tick_meter = cv.TickMeter()
 
     # Get frame height and width
     height_ = frame.shape[0]
@@ -108,9 +118,11 @@ if __name__ == "__main__":
     # Run the detection model
     detector.setInput(blob)
 
-    tickmeter.start()
+    tick_meter.start()
     outs = detector.forward(outNames)
-    tickmeter.stop()
+    tick_meter.stop()
+
+    coords_list = []
 
     # Get scores and geometry
     scores = outs[0]
@@ -127,22 +139,35 @@ if __name__ == "__main__":
             vertices[j][0] *= rW
             vertices[j][1] *= rH
 
+        x_coords = []
+        y_coords = []
         for j in range(4):
             p1 = (vertices[j][0], vertices[j][1])
-            pt1 = (int(p1[0]), int(p1[1]))
             p2 = (vertices[(j + 1) % 4][0], vertices[(j + 1) % 4][1])
-            pt2 = (int(p2[0]), int(p2[1]))
-            cv.line(frame, pt1, pt2, (0, 255, 0), 1)
+            ptA = (int(p1[0]), int(p1[1]))
+            ptB = (int(p2[0]), int(p2[1]))
+            cv.line(frame, ptA, ptB, (0, 255, 0), 1)
+            x_coords.append(ptA[0])
+            y_coords.append(ptA[1])
+
+        coords = (min(x_coords), max(x_coords), min(y_coords), max(y_coords))
+        coords_list.append(coords)
+
+    lama_inpaint = LamaInpaint()
+    mask = create_mask((height_, width_), coords_list)
+    inpainted_frame = lama_inpaint(frame, mask)
+    cv.imencode(".png", inpainted_frame)[1].tofile("inpainted_frame.png")
 
     # Put efficiency information
-    label = 'Inference time: %.2f ms' % (tickmeter.getTimeMilli())
-    cv.putText(frame, label, (0, 15), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0))
+    label = 'Inference time: %.2f ms' % (tick_meter.getTimeMilli())
+    print(label)
 
     # Create a new named window
     kWinName = "EAST: An Efficient and Accurate Scene Text Detector"
     cv.namedWindow(kWinName, cv.WINDOW_NORMAL)
+
     # Display the frame
     cv.imshow(kWinName, frame)
-    tickmeter.reset()
+    tick_meter.reset()
     cv.waitKey(0)
     cv.destroyAllWindows()
